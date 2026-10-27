@@ -13,7 +13,7 @@ struct InstalledApp: Identifiable, Hashable, Sendable {
     let tweaks: [String]      // .dylib injectés dans Frameworks/
     let frameworks: [String]  // .framework de hooking (CydiaSubstrate, ElleKit…) dans Frameworks/
     let size: Int64
-    let isSelf: Bool          // JacIPA lui-même
+    let isSelf: Bool          // app de Jacob (JacIPA, JacNav…) : badge « moi », pas de vérif App Store
 
     var versionText: String {
         build.isEmpty || build == version ? version : "\(version) (\(build))"
@@ -144,6 +144,13 @@ enum InstalledApps {
     /// peut être celui de LiveContainer).
     static let ownBundleId = "com.mammouthgaming.JacIPA"
 
+    /// Préfixes des apps de Jacob (JacIPA, JacNav…) : marquées « moi », jamais cherchées sur l'App Store.
+    static let ownPrefixes = ["com.mammouthgaming.", "JacobVeilleux."]
+
+    static func isOwn(bundleId: String) -> Bool {
+        bundleId == ownBundleId || ownPrefixes.contains { bundleId.lowercased().hasPrefix($0.lowercased()) }
+    }
+
     private static func read(bundle: URL, id: String, ownURL: URL) -> InstalledApp? {
         let plistURL = bundle.appendingPathComponent("Info.plist")
         guard let data = try? Data(contentsOf: plistURL),
@@ -169,7 +176,7 @@ enum InstalledApps {
         return InstalledApp(id: id, bundleURL: bundle, name: name, bundleId: bundleId, version: version, build: build,
                             executable: executable, iconURL: iconURL(in: bundle, plist: plist),
                             tweaks: tweaks, frameworks: frameworks, size: ExportStore.folderSize(bundle),
-                            isSelf: bundleId == ownBundleId || bundle.resolvingSymlinksInPath().path == ownURL.path)
+                            isSelf: isOwn(bundleId: bundleId) || bundle.resolvingSymlinksInPath().path == ownURL.path)
     }
 
     /// Dylibs de tweak et frameworks de hooking présents dans Frameworks/.
@@ -217,7 +224,7 @@ enum InstalledApps {
             }
         }
         // Dernier recours : n'importe quel PNG dont le nom contient « icon ».
-        if let items = try? fm.contentsOfDirectory(at: bundle, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+        if let items = try? fm.contentsOfDirectory(at: bundle, includingPropertiesForKeys: nil, options: [.skipsHiddenPiles]) {
             return items.first { $0.pathExtension.lowercased() == "png" && $0.lastPathComponent.lowercased().contains("icon") }
         }
         return nil
