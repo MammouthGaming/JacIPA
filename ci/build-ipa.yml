@@ -1,0 +1,59 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: IPA non signé (pour LiveContainer)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version d'Xcode
+        run: xcodebuild -version
+
+      - name: Compiler (Release, iphoneos, sans signature)
+        run: |
+          xcodebuild \
+            -project JacIPA.xcodeproj \
+            -target JacIPA \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            CONFIGURATION_BUILD_DIR="$PWD/out" \
+            build
+
+      - name: Empaqueter JacIPA.ipa
+        run: |
+          test -d out/JacIPA.app
+          rm -rf Payload && mkdir Payload
+          cp -R out/JacIPA.app Payload/
+          zip -qry JacIPA.ipa Payload
+          ls -la JacIPA.ipa
+          unzip -l JacIPA.ipa | tail -n 3
+
+      - name: Publier l'artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JacIPA-ipa
+          path: JacIPA.ipa
+          if-no-files-found: error
+
+      - name: Release GitHub (tags v* seulement)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: JacIPA.ipa
+          generate_release_notes: true

@@ -10,6 +10,16 @@ struct ExportEntry: Identifiable, Hashable {
     var id: String { url.path }
 }
 
+/// Une opération réussie (Deb → dylib, Extraire, Nettoyer, Injecter), pour l'onglet Historique.
+struct HistoryEntry: Identifiable, Codable, Hashable {
+    var id = UUID()
+    var date = Date()
+    let tool: String
+    let source: String
+    let output: String
+    let details: [String]
+}
+
 /// Tout ce que JacIPA produit va dans Documents/Exports, visible dans l'app Fichiers
 /// (Sur mon iPhone → JacIPA → Exports).
 enum ExportStore {
@@ -87,6 +97,31 @@ enum ExportStore {
         .sorted { $0.date > $1.date }
     }
 
+    /// Tous les .dylib et .framework présents dans Exports (récursif), les plus récents d'abord.
+    /// Sert au sélecteur « Injecter un dylib ».
+    static func allInjectables() -> [ExportEntry] {
+        let fm = FileManager.default
+        let keys: [URLResourceKey] = [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+        guard let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else {
+            return []
+        }
+        var out: [ExportEntry] = []
+        for case let url as URL in enumerator {
+            let name = url.lastPathComponent
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            let isDir = values?.isDirectory ?? false
+            if isDir, name.hasSuffix(".framework") {
+                out.append(ExportEntry(url: url, name: name, isDirectory: true, size: folderSize(url),
+                                       date: values?.contentModificationDate ?? .distantPast))
+                enumerator.skipDescendants()
+            } else if !isDir, name.hasSuffix(".dylib") {
+                out.append(ExportEntry(url: url, name: name, isDirectory: false, size: Int64(values?.fileSize ?? 0),
+                                       date: values?.contentModificationDate ?? .distantPast))
+            }
+        }
+        return out.sorted { $0.date > $1.date }
+    }
+
     static func folderSize(_ url: URL) -> Int64 {
         guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey]) else { return 0 }
         var total: Int64 = 0
@@ -98,5 +133,67 @@ enum ExportStore {
 
     static func delete(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
+    }
+
+    /// Vide Exports (les fichiers seulement, l'historique reste).
+    static func deleteAll() {
+        for entry in list() { delete(entry.url) }
+    }
+
+    /// URL qui ouvre le dossier Exports dans l'app Fichiers.
+    static var filesAppURL: URL? {
+        URL(string: "shareddocuments://" + root.path)
+    }
+
+    // MARK: - Historique
+
+    private static let historyLock = NSLock()
+    private static let historyLimit = 200
+
+    private static var historyURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("historique.json")
+    }
+
+    static func history() -> [HistoryEntry] {
+        historyLock.lock()
+        defer { historyLock.unlock() }
+        return loadHistory()
+    }
+
+    private static func loadHistory() -> [HistoryEntry] {
+        guard let data = try? Data(contentsOf: historyURL),
+              let entries = try? JSONDecoder().decode([HistoryEntry].self, from: data) else { return [] }
+        return entries
+    }
+
+    private static func saveHistory(_ entries: [HistoryEntry]) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(entries) {
+            try? data.write(to: historyURL, options: .atomic)
+        }
+    }
+
+    /// Note une opération réussie. Appelé depuis les tâches de fond : protégé par un verrou.
+    static func log(tool: String, source: String, output: String, details: [String]) {
+        historyLock.lock()
+        defer { historyLock.unlock() }
+        var entries = loadHistory()
+        entries.insert(HistoryEntry(tool: tool, source: source, output: output, details: details), at: 0)
+        if entries.count > historyLimit { entries.removeLast(entries.count - historyLimit) }
+        saveHistory(entries)
+    }
+
+    static func removeHistory(ids: Set<UUID>) {
+        historyLock.lock()
+        defer { historyLock.unlock() }
+        saveHistory(loadHistory().filter { !ids.contains($0.id) })
+    }
+
+    static func clearHistory() {
+        historyLock.lock()
+        defer { historyLock.unlock() }
+        try? FileManager.default.removeItem(at: historyURL)
     }
 }

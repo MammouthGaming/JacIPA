@@ -29,7 +29,7 @@ struct DebView: View {
                         Text(errorText).foregroundStyle(.red)
                     }
                 } footer: {
-                    Text("Ouvre un paquet .deb (rootless ou roothide) et sort les .dylib, .bundle et filtres .plist prêts pour LiveContainer.")
+                    Text("Ouvre un paquet .deb (rootless ou roothide ; gz, xz, lzma, zstd, bz2) et sort les .dylib, .bundle et filtres .plist prêts pour LiveContainer.")
                 }
 
                 if let result {
@@ -37,6 +37,7 @@ struct DebView: View {
                 }
             }
             .navigationTitle("Deb → dylib")
+            .aboutToolbar()
             .fileImporter(isPresented: $showPicker, allowedContentTypes: [.item], allowsMultipleSelection: false) { res in
                 switch res {
                 case .success(let urls):
@@ -93,6 +94,9 @@ struct DebView: View {
             Text("Ensuite : LiveContainer → Tweaks → dossier de l'app → + → Fichiers → JacIPA → Exports → le .dylib.")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
+            Text("Ou : onglet IPA → Injecter un dylib, pour une app tout-en-un.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -125,7 +129,13 @@ struct DebView: View {
         Task { @MainActor in
             do {
                 let local = try ExportStore.importToTemp(url)
-                result = try await DebExtractor.extract(url: local)
+                let r = try await DebExtractor.extract(url: local)
+                result = r
+                var details = r.dylibs.map { $0.exportedURL.lastPathComponent }
+                details += r.plists.map { $0.exportedURL.lastPathComponent }
+                details += r.bundles
+                ExportStore.log(tool: "Deb → dylib", source: local.lastPathComponent,
+                                output: r.exportFolder.lastPathComponent, details: details)
             } catch {
                 errorText = error.localizedDescription
             }
