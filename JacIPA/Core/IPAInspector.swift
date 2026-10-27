@@ -47,7 +47,7 @@ struct IPAActionResult: Sendable {
     let warnings: [String]
 }
 
-/// Outils 2 et 3 : inspection d'un IPA, extraction des tweaks, nettoyage.
+/// Outils 2, 3 et 4 : inspection d'un IPA, extraction des tweaks, nettoyage, injection.
 enum IPAInspector {
     private static let knownDependencies = [
         "cydiasubstrate", "libsubstrate", "libsubstitute", "substitute", "ellekit", "libellekit",
@@ -55,6 +55,8 @@ enum IPAInspector {
         "flex.framework", "libmryipc", "libpackageinfo", "rocketbootstrap", "libsparkapplist",
         "libactivator", "libcsutil", "libimagepicker", "preferenceloader", "libprefs"
     ]
+
+    private static let arm64: UInt32 = 0x0100_000C
 
     // MARK: - Analyse
 
@@ -96,7 +98,7 @@ enum IPAInspector {
             warnings.append("Binaire principal introuvable (\(executable)).")
         }
 
-        let mainSlice = slices.first(where: { $0.cpuType == 0x0100_000C }) ?? slices.first
+        let mainSlice = slices.first(where: { $0.cpuType == arm64 }) ?? slices.first
         let loaded = mainSlice?.dylibs ?? []
 
         // Inventaire de Frameworks/ et des .dylib à la racine de l'app
@@ -226,6 +228,8 @@ enum IPAInspector {
             }
         }
 
+        ExportStore.log(tool: "Extraire", source: analysis.sourceURL.lastPathComponent,
+                        output: folder.lastPathComponent, details: details)
         return IPAActionResult(outputURL: folder, details: details,
                                warnings: ["Pour LiveContainer : importe les .dylib dans Tweaks → dossier de l'app. Les .framework marchent rarement tels quels."])
     }
@@ -276,7 +280,7 @@ enum IPAInspector {
         try writer.finish()
 
         // Un dylib retiré qui n'était pas en dernière position décale les ordinaux : risque.
-        let total = (analysis.slices.first(where: { $0.cpuType == 0x0100_000C }) ?? analysis.slices.first)?.dylibs.count ?? 0
+        let total = (analysis.slices.first(where: { $0.cpuType == arm64 }) ?? analysis.slices.first)?.dylibs.count ?? 0
         for item in items {
             if let idx = item.loadIndex, idx < total - 1 {
                 warnings.append("\(item.name) n'était pas le dernier dylib chargé (\(idx + 1)/\(total)). Si l'app plante au lancement, c'est ça.")
@@ -289,6 +293,170 @@ enum IPAInspector {
 
         var details = ["\(skipped) fichier(s) retiré(s)"]
         details += removedCommands.map { "Commande retirée : \($0)" }
+        ExportStore.log(tool: "Nettoyer", source: analysis.sourceURL.lastPathComponent,
+                        output: output.lastPathComponent, details: details)
+        return IPAActionResult(outputURL: output, details: details, warnings: warnings)
+    }
+
+    // MARK: - Injection
+
+    /// `files` : des .dylib (exportés par Deb → dylib ou choisis dans Fichiers) et/ou des dossiers .framework
+    /// (ex. CydiaSubstrate.framework pris dans Fichiers → LiveContainer → Tweaks).
+    static func inject(_ analysis: IPAAnalysis, files: [URL]) async throws -> IPAActionResult {
+        try await Task.detached(priority: .userInitiated) {
+            try injectSync(analysis, files: files)
+        }.value
+    }
+
+    private struct InjectPayload {
+        let zipPath: String
+        let data: Data
+        let executable: Bool
+    }
+
+    static func injectSync(_ analysis: IPAAnalysis, files: [URL]) throws -> IPAActionResult {
+        guard !files.isEmpty else { throw JacIPAError.message("Rien à injecter.") }
+        if analysis.encrypted == true {
+            throw JacIPAError.message("IPA chiffré (FairPlay) : inutile d'injecter, l'app ne se lancerait pas dans LiveContainer.")
+        }
+        let zip = try ZipReader(url: analysis.sourceURL)
+        let binPath = analysis.appDir + analysis.executable
+        guard zip.entry(named: binPath) != nil else {
+            throw JacIPAError.message("Binaire principal introuvable (\(analysis.executable)).")
+        }
+        let fwPrefix = analysis.appDir + "Frameworks/"
+        let fm = FileManager.default
+
+        var payloads: [InjectPayload] = []
+        var dylibNames: [String] = []
+        var frameworkNames: [String] = []
+        var details: [String] = []
+        var warnings: [String] = []
+        var dependencies: [(dylib: String, path: String)] = []
+
+        for url in files {
+            var isDir: ObjCBool = false
+            let name = url.lastPathComponent
+            guard fm.fileExists(atPath: url.path, isDirectory: &isDir) else {
+                throw JacIPAError.message("Introuvable : \(name)")
+            }
+
+            if isDir.boolValue {
+                guard name.hasSuffix(".framework") else {
+                    throw JacIPAError.message("\(name) : seuls les dossiers .framework peuvent être injectés.")
+                }
+                let stem = (name as NSString).deletingPathExtension
+                let keys: [URLResourceKey] = [.isRegularFileKey, .isSymbolicLinkKey]
+                guard let enumerator = fm.enumerator(at: url, includingPropertiesForKeys: keys, options: [.skipsHiddenFiles]) else {
+                    throw JacIPAError.message("Impossible de lire \(name).")
+                }
+                let base = url.path + "/"
+                var count = 0
+                for case let f as URL in enumerator {
+                    let values = try? f.resourceValues(forKeys: Set(keys))
+                    guard values?.isRegularFile == true, values?.isSymbolicLink != true else { continue }
+                    guard f.path.hasPrefix(base) else { continue }
+                    let rel = String(f.path.dropFirst(base.count))
+                    let data = try Data(contentsOf: f)
+                    payloads.append(InjectPayload(zipPath: fwPrefix + name + "/" + rel, data: data, executable: rel == stem))
+                    count += 1
+                }
+                guard count > 0 else { throw JacIPAError.message("\(name) est vide.") }
+                frameworkNames.append(name)
+                details.append("\(name) copié dans Frameworks/ (\(count) fichiers)")
+            } else {
+                let data = try Data(contentsOf: url)
+                guard MachO.isMachO(data) else { throw JacIPAError.message("\(name) n'est pas un binaire Mach-O.") }
+                let slices = try MachO.slices(in: data)
+                guard let arm = slices.first(where: { $0.cpuType == arm64 }) else {
+                    throw JacIPAError.message("\(name) n'a pas de tranche arm64.")
+                }
+                let fileName = name.hasSuffix(".dylib") ? name : name + ".dylib"
+                let patched = try MachO.rewritingHookingDependencies(in: data)
+                for p in patched.rewritten {
+                    details.append("\(fileName) : dépendance \(p) → \(MachO.substrateRpath)")
+                }
+                for p in patched.failed {
+                    warnings.append("\(fileName) : dépendance \(p) impossible à réécrire (pas la place dans la commande).")
+                }
+                for ref in arm.dylibs {
+                    let path = patched.rewritten.contains(ref.path) ? MachO.substrateRpath : ref.path
+                    dependencies.append((fileName, path))
+                }
+                payloads.append(InjectPayload(zipPath: fwPrefix + fileName, data: patched.data, executable: true))
+                dylibNames.append(fileName)
+            }
+        }
+
+        // Nom de sortie : Spotify+GTok.ipa
+        let stems = dylibNames.map { ($0 as NSString).deletingPathExtension }
+        let suffix = stems.isEmpty ? "inject" : stems.joined(separator: "+")
+        let output = ExportStore.uniqueFile(named: ExportStore.sanitize(analysis.appName) + "+" + suffix + ".ipa")
+        let writer = try ZipWriter(url: output)
+        let replacedPaths = Set(payloads.map(\.zipPath))
+        let replacedFrameworkPrefixes = frameworkNames.map { fwPrefix + $0 + "/" }
+        let stamp = ZipWriter.dosDateTime()
+        var addedCommands: [String] = []
+        var replaced = 0
+
+        for e in zip.entries {
+            if replacedPaths.contains(e.name) || replacedFrameworkPrefixes.contains(where: { e.name.hasPrefix($0) }) {
+                replaced += 1
+                continue
+            }
+            if e.name == binPath {
+                let bin = try zip.read(e)
+                if dylibNames.isEmpty {
+                    let raw = try zip.rawCompressedData(of: e)
+                    try writer.addRaw(path: e.name, method: e.method, crc32: e.crc32, compressed: raw,
+                                      uncompressedSize: e.uncompressedSize, externalAttributes: e.externalAttributes,
+                                      dosTime: e.dosTime, dosDate: e.dosDate)
+                } else {
+                    let result = try MachO.addingDylibs(to: bin, paths: dylibNames.map { "@rpath/" + $0 })
+                    addedCommands = result.added
+                    warnings += result.warnings
+                    try writer.addStored(path: e.name, data: result.data, externalAttributes: e.externalAttributes,
+                                         dosTime: e.dosTime, dosDate: e.dosDate)
+                }
+            } else {
+                let raw = try zip.rawCompressedData(of: e)
+                try writer.addRaw(path: e.name, method: e.method, crc32: e.crc32, compressed: raw,
+                                  uncompressedSize: e.uncompressedSize, externalAttributes: e.externalAttributes,
+                                  dosTime: e.dosTime, dosDate: e.dosDate)
+            }
+        }
+        for p in payloads {
+            let mode: UInt32 = p.executable ? 0o100755 : 0o100644
+            try writer.addStored(path: p.zipPath, data: p.data, externalAttributes: mode << 16,
+                                 dosTime: stamp.time, dosDate: stamp.date)
+        }
+        try writer.finish()
+
+        details.insert("\(dylibNames.count) dylib(s) et \(frameworkNames.count) framework(s) ajoutés dans \(analysis.executable).app/Frameworks/", at: 0)
+        if replaced > 0 { details.append("\(replaced) fichier(s) déjà présent(s) remplacé(s)") }
+        details += addedCommands.map { "Commande ajoutée : \($0)" }
+
+        // Dépendances des dylibs injectés : tout ce qui n'est ni système ni dans l'IPA finira en plantage.
+        var bundled = Set(zip.entries.map(\.name))
+        for p in payloads { bundled.insert(p.zipPath) }
+        func isBundled(_ dep: String) -> Bool {
+            let file = (dep as NSString).lastPathComponent
+            let tail = dep.split(separator: "/").suffix(2).joined(separator: "/")
+            return bundled.contains { $0.hasPrefix(fwPrefix) && ($0 == fwPrefix + file || $0.hasSuffix("/" + tail)) }
+        }
+        var reported = Set<String>()
+        for dep in dependencies {
+            guard !MachO.isSystemLibrary(dep.path), !isBundled(dep.path), reported.insert(dep.path).inserted else { continue }
+            if MachO.isHookingLibrary(dep.path) {
+                warnings.append("\(dep.dylib) a besoin de CydiaSubstrate (\(dep.path)) et il n'est pas dans l'IPA. Si l'app plante au lancement : refais l'injection en ajoutant CydiaSubstrate.framework (Fichiers → LiveContainer → Tweaks).")
+            } else {
+                warnings.append("\(dep.dylib) dépend de \(dep.path), absent de l'IPA : plantage possible au lancement.")
+            }
+        }
+        warnings.append("La signature de l'IPA n'est plus valide : normal, LiveContainer / SideStore re-signent à l'import.")
+
+        ExportStore.log(tool: "Injecter", source: analysis.sourceURL.lastPathComponent,
+                        output: output.lastPathComponent, details: details)
         return IPAActionResult(outputURL: output, details: details, warnings: warnings)
     }
 }
