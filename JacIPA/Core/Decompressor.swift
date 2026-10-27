@@ -35,12 +35,13 @@ enum Decompressor {
             return try decode(stripGzipHeader(data), algorithm: COMPRESSION_ZLIB)
         case .xz:
             return try decode(data, algorithm: COMPRESSION_LZMA)
+        case .lzmaAlone:
+            // LZMA 1 « alone » (dpkg ancien, utilisé par GTok) : pas géré par Compression → décodeur maison.
+            return try LzmaAloneDecoder.decode(data)
         case .zstd:
             throw JacIPAError.message("\(filename) est compressé en zstd. Pas encore géré par JacIPA (prévu dans une prochaine version).")
         case .bzip2:
             throw JacIPAError.message("\(filename) est compressé en bzip2. Pas géré par JacIPA.")
-        case .lzmaAlone:
-            throw JacIPAError.message("\(filename) est en .lzma (ancien format). Pas géré par JacIPA.")
         case .unknown:
             throw JacIPAError.message("Format de compression inconnu pour \(filename).")
         }
