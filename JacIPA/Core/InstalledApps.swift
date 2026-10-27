@@ -129,18 +129,22 @@ enum InstalledApps {
         }
         ensureAccess(folder)
 
-        let ownBundleId = Bundle.main.bundleIdentifier ?? "com.mammouthgaming.JacIPA"
+        let ownURL = Bundle.main.bundleURL.resolvingSymlinksInPath()
         var apps: [InstalledApp] = []
 
         for entry in appBundles(in: folder) {
-            if let app = read(bundle: entry.bundle, id: entry.id, ownBundleId: ownBundleId) {
+            if let app = read(bundle: entry.bundle, id: entry.id, ownURL: ownURL) {
                 apps.append(app)
             }
         }
         return apps.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    private static func read(bundle: URL, id: String, ownBundleId: String) -> InstalledApp? {
+    /// Identifiant de JacIPA (défini en dur : dans LiveContainer, `Bundle.main.bundleIdentifier`
+    /// peut être celui de LiveContainer).
+    static let ownBundleId = "com.mammouthgaming.JacIPA"
+
+    private static func read(bundle: URL, id: String, ownURL: URL) -> InstalledApp? {
         let plistURL = bundle.appendingPathComponent("Info.plist")
         guard let data = try? Data(contentsOf: plistURL),
               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
@@ -148,7 +152,11 @@ enum InstalledApps {
         }
         let executable = plist["CFBundleExecutable"] as? String ?? bundle.deletingPathExtension().lastPathComponent
         let name = plist["CFBundleDisplayName"] as? String ?? plist["CFBundleName"] as? String ?? executable
-        let bundleId = plist["CFBundleIdentifier"] as? String ?? "?"
+        // LiveContainer peut remplacer CFBundleIdentifier par le sien (option « bundle id de LC »)
+        // et garde l'original dans LCOrignalBundleIdentifier (faute d'orthographe voulue, c'est leur clé).
+        let bundleId = plist["LCOrignalBundleIdentifier"] as? String
+            ?? plist["CFBundleIdentifier"] as? String
+            ?? "?"
         let version = plist["CFBundleShortVersionString"] as? String ?? ""
         let build = plist["CFBundleVersion"] as? String ?? ""
 
@@ -157,7 +165,7 @@ enum InstalledApps {
         return InstalledApp(id: id, bundleURL: bundle, name: name, bundleId: bundleId, version: version, build: build,
                             executable: executable, iconURL: iconURL(in: bundle, plist: plist),
                             tweaks: tweaks, frameworks: frameworks, size: ExportStore.folderSize(bundle),
-                            isSelf: bundleId == ownBundleId)
+                            isSelf: bundleId == ownBundleId || bundle.resolvingSymlinksInPath().path == ownURL.path)
     }
 
     /// Dylibs de tweak et frameworks de hooking présents dans Frameworks/.
