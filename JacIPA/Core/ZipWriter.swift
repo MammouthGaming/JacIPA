@@ -16,6 +16,17 @@ final class ZipWriter {
         handle = try FileHandle(forWritingTo: url)
     }
 
+    /// Date / heure au format MS-DOS pour une entrée neuve (fichiers injectés).
+    static func dosDateTime(_ date: Date = Date()) -> (time: UInt16, date: UInt16) {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = .current
+        let c = cal.dateComponents([.year, .month, .day, .hour, .minute, .second], from: date)
+        let year = max(1980, c.year ?? 1980)
+        let time = UInt16(((c.hour ?? 0) << 11) | ((c.minute ?? 0) << 5) | ((c.second ?? 0) / 2))
+        let day = UInt16(((year - 1980) << 9) | ((c.month ?? 1) << 5) | (c.day ?? 1))
+        return (time, day)
+    }
+
     func addStored(path: String, data: Data, externalAttributes: UInt32, dosTime: UInt16, dosDate: UInt16) throws {
         let crc = CRC32.checksum(data)
         try addRaw(path: path, method: 0, crc32: crc, compressed: data, uncompressedSize: UInt64(data.count),
