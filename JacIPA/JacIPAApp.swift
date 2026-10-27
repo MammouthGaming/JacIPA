@@ -15,9 +15,9 @@ struct JacIPAApp: App {
 
 @MainActor
 final class AppModel: ObservableObject {
-    enum Tab: Hashable { case deb, ipa, exports }
+    enum Tab: Hashable { case apps, deb, ipa, exports }
 
-    @Published var tab: Tab = .deb
+    @Published var tab: Tab = .apps
     @Published var incomingDeb: URL?
     @Published var incomingIPA: URL?
 

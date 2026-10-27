@@ -5,6 +5,9 @@ struct ContentView: View {
 
     var body: some View {
         TabView(selection: $model.tab) {
+            AppsView()
+                .tabItem { Label("Apps", systemImage: "square.grid.2x2") }
+                .tag(AppModel.Tab.apps)
             DebView()
                 .tabItem { Label("Deb", systemImage: "shippingbox") }
                 .tag(AppModel.Tab.deb)
