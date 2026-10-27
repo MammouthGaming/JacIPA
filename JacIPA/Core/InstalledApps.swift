@@ -224,7 +224,7 @@ enum InstalledApps {
             }
         }
         // Dernier recours : n'importe quel PNG dont le nom contient « icon ».
-        if let items = try? fm.contentsOfDirectory(at: bundle, includingPropertiesForKeys: nil, options: [.skipsHiddenPiles]) {
+        if let items = try? fm.contentsOfDirectory(at: bundle, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
             return items.first { $0.pathExtension.lowercased() == "png" && $0.lastPathComponent.lowercased().contains("icon") }
         }
         return nil
