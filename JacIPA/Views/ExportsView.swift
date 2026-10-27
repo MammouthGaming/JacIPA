@@ -19,14 +19,17 @@ struct ExportsView: View {
                     HistoryView()
                 }
             }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                Picker("Affichage", selection: $mode) {
-                    ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+            // Le sélecteur vit dans la barre de navigation (placement .principal) : avec un
+            // safeAreaInset il masquait le grand titre et laissait un bandeau vide (iOS 26).
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Picker("Affichage", selection: $mode) {
+                        ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .pickerStyle(.segmented)
+                    .frame(maxWidth: 240)
                 }
-                .pickerStyle(.segmented)
-                .padding(.horizontal)
-                .padding(.bottom, 8)
-                .background(.bar)
             }
             .aboutToolbar()
         }
