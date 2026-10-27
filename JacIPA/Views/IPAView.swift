@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 struct IPAView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showPicker = false
+    @State private var showInjectPicker = false
     @State private var working = false
     @State private var workingLabel = ""
     @State private var analysis: IPAAnalysis?
@@ -32,7 +33,7 @@ struct IPAView: View {
                         Text(errorText).foregroundStyle(.red)
                     }
                 } footer: {
-                    Text("Dit si l'IPA est déchiffré, liste les tweaks injectés, et peut les extraire ou produire un IPA propre.")
+                    Text("Dit si l'IPA est déchiffré, liste les tweaks injectés, et peut les extraire, les retirer, ou en injecter un nouveau.")
                 }
 
                 if let a = analysis {
@@ -44,8 +45,12 @@ struct IPAView: View {
                 if let r = actionResult {
                     Section("Résultat") {
                         LabeledContent("Sortie", value: "Exports/" + r.outputURL.lastPathComponent)
-                        ForEach(r.details, id: \.self) { Text($0).font(.footnote) }
-                        ForEach(r.warnings, id: \.self) { Text("⚠️ " + $0).font(.footnote).foregroundStyle(.orange) }
+                        ForEach(Array(r.details.enumerated()), id: \.offset) { _, d in
+                            Text(d).font(.footnote)
+                        }
+                        ForEach(Array(r.warnings.enumerated()), id: \.offset) { _, w in
+                            Text("⚠️ " + w).font(.footnote).foregroundStyle(.orange)
+                        }
                         ShareLink(item: r.outputURL) {
                             Label("Partager", systemImage: "square.and.arrow.up")
                         }
@@ -53,12 +58,20 @@ struct IPAView: View {
                 }
             }
             .navigationTitle("IPA")
+            .aboutToolbar()
             .fileImporter(isPresented: $showPicker, allowedContentTypes: [.item], allowsMultipleSelection: false) { res in
                 switch res {
                 case .success(let urls):
                     if let url = urls.first { analyze(url) }
                 case .failure(let error):
                     errorText = error.localizedDescription
+                }
+            }
+            .sheet(isPresented: $showInjectPicker) {
+                if let a = analysis {
+                    InjectPickerView(appName: a.appName) { files in
+                        runAction(label: "Injection…") { try await IPAInspector.inject(a, files: files) }
+                    }
                 }
             }
             .onChange(of: model.incomingIPA) { _, newValue in
@@ -85,7 +98,9 @@ struct IPAView: View {
         }
         if !a.warnings.isEmpty {
             Section("Avertissements") {
-                ForEach(a.warnings, id: \.self) { Text("⚠️ " + $0).font(.footnote).foregroundStyle(.orange) }
+                ForEach(Array(a.warnings.enumerated()), id: \.offset) { _, w in
+                    Text("⚠️ " + w).font(.footnote).foregroundStyle(.orange)
+                }
             }
         }
     }
@@ -140,7 +155,7 @@ struct IPAView: View {
     @ViewBuilder
     private func actionsSection(_ a: IPAAnalysis) -> some View {
         let chosen = a.items.filter { selected.contains($0.id) }
-        Section("Actions") {
+        Section {
             Button {
                 runAction(label: "Extraction…") { try await IPAInspector.extract(a, items: chosen) }
             } label: {
@@ -154,6 +169,21 @@ struct IPAView: View {
                 Label("Nettoyer l'IPA (retirer la sélection)", systemImage: "sparkles")
             }
             .disabled(chosen.isEmpty || working)
+
+            Button {
+                showInjectPicker = true
+            } label: {
+                Label("Injecter un dylib dans l'IPA…", systemImage: "syringe")
+            }
+            .disabled(working || a.encrypted == true)
+        } header: {
+            Text("Actions")
+        } footer: {
+            if a.encrypted == true {
+                Text("Injection désactivée : l'IPA est chiffré, il ne se lancerait pas dans LiveContainer.")
+            } else {
+                Text("Injecter : choisis un .dylib sorti par Deb → dylib (ex. GTok) pour obtenir un IPA tout-en-un, à importer tel quel dans LiveContainer.")
+            }
         }
     }
 
@@ -209,5 +239,109 @@ struct IPAView: View {
             }
             working = false
         }
+    }
+}
+
+/// Feuille « Injecter » : .dylib / .framework déjà dans Exports, plus des fichiers pris dans Fichiers.
+struct InjectPickerView: View {
+    let appName: String
+    let onConfirm: ([URL]) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var entries: [ExportEntry] = []
+    @State private var selected = Set<String>()
+    @State private var extra: [URL] = []
+    @State private var showPicker = false
+    @State private var errorText: String?
+
+    private var count: Int { selected.count + extra.count }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    if entries.isEmpty {
+                        Text("Aucun .dylib dans Exports. Passe d'abord par Deb → dylib, ou choisis un fichier plus bas.")
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(entries) { entry in
+                        Toggle(isOn: binding(for: entry.id)) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(entry.name).font(.body.monospaced()).lineLimit(1)
+                                Text(entry.url.deletingLastPathComponent().lastPathComponent + " · " + entry.size.fileSizeText)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Depuis Exports")
+                } footer: {
+                    Text("Le .dylib est copié dans Frameworks/ et le binaire principal reçoit une commande de chargement (comme insert_dylib). Si le tweak a besoin de CydiaSubstrate et que l'app plante, ajoute CydiaSubstrate.framework depuis Fichiers → LiveContainer → Tweaks.")
+                }
+
+                Section("Autres fichiers") {
+                    ForEach(extra, id: \.self) { url in
+                        HStack {
+                            Image(systemName: url.lastPathComponent.hasSuffix(".framework") ? "shippingbox" : "puzzlepiece.extension")
+                                .foregroundStyle(.tint)
+                            Text(url.lastPathComponent).font(.body.monospaced()).lineLimit(1)
+                        }
+                    }
+                    .onDelete { offsets in extra.remove(atOffsets: offsets) }
+
+                    Button {
+                        showPicker = true
+                    } label: {
+                        Label("Choisir dans Fichiers…", systemImage: "folder.badge.plus")
+                    }
+                    if let errorText {
+                        Text(errorText).font(.footnote).foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle("Injecter dans \(appName)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Annuler") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Injecter (\(count))") { confirm() }
+                        .disabled(count == 0)
+                }
+            }
+            .fileImporter(isPresented: $showPicker, allowedContentTypes: [.item, .folder], allowsMultipleSelection: true) { res in
+                switch res {
+                case .success(let urls):
+                    for url in urls {
+                        do {
+                            let local = try ExportStore.importToTemp(url)
+                            if !extra.contains(local) { extra.append(local) }
+                        } catch {
+                            errorText = error.localizedDescription
+                        }
+                    }
+                case .failure(let error):
+                    errorText = error.localizedDescription
+                }
+            }
+            .onAppear { entries = ExportStore.allInjectables() }
+        }
+    }
+
+    private func binding(for id: String) -> Binding<Bool> {
+        Binding(
+            get: { selected.contains(id) },
+            set: { on in
+                if on { selected.insert(id) } else { selected.remove(id) }
+            }
+        )
+    }
+
+    private func confirm() {
+        let files = entries.filter { selected.contains($0.id) }.map(\.url) + extra
+        dismiss()
+        onConfirm(files)
     }
 }
