@@ -5,14 +5,18 @@ enum CompressionKind: Equatable {
     case none, gzip, xz, zstd, bzip2, lzmaAlone, unknown
 
     /// Détection par les octets magiques d'abord, par l'extension ensuite.
+    /// Tous les formats que dpkg sait produire sont couverts : none, gzip, xz, zstd, bzip2, lzma.
     static func detect(data: Data, filename: String) -> CompressionKind {
-        if data.count >= 6 {
+        if data.count >= 13 {
             if data.byte(0) == 0x1F, data.byte(1) == 0x8B { return .gzip }
             if data.byte(0) == 0xFD, data.byte(1) == 0x37, data.byte(2) == 0x7A,
                data.byte(3) == 0x58, data.byte(4) == 0x5A { return .xz }
             if data.byte(0) == 0x28, data.byte(1) == 0xB5, data.byte(2) == 0x2F, data.byte(3) == 0xFD { return .zstd }
-            if data.byte(0) == 0x42, data.byte(1) == 0x5A, data.byte(2) == 0x68 { return .bzip2 }
+            if data.byte(0) == 0x42, data.byte(1) == 0x5A, data.byte(2) == 0x68,
+               data.byte(3) >= 0x31, data.byte(3) <= 0x39 { return .bzip2 }
             if data.count > 262, data.ascii(257, 5) == "ustar" { return .none }
+            // LZMA « alone » n'a pas de magic : propriétés < 225 et taille décompressée inconnue (8 × 0xFF).
+            if data.byte(0) < 0xE1, (5 ..< 13).allSatisfy({ data.byte($0) == 0xFF }) { return .lzmaAlone }
         }
         let lower = filename.lowercased()
         if lower.hasSuffix(".gz") { return .gzip }
@@ -39,11 +43,13 @@ enum Decompressor {
             // LZMA 1 « alone » (dpkg ancien, utilisé par GTok) : pas géré par Compression → décodeur maison.
             return try LzmaAloneDecoder.decode(data)
         case .zstd:
-            throw JacIPAError.message("\(filename) est compressé en zstd. Pas encore géré par JacIPA (prévu dans une prochaine version).")
+            // dpkg ≥ 1.21 (Ubuntu, Procursus récents) : pas géré par Compression → décodeur maison.
+            return try ZstdDecoder.decode(data)
         case .bzip2:
-            throw JacIPAError.message("\(filename) est compressé en bzip2. Pas géré par JacIPA.")
+            // Vieux .deb : pas géré par Compression → décodeur maison.
+            return try Bzip2Decoder.decode(data)
         case .unknown:
-            throw JacIPAError.message("Format de compression inconnu pour \(filename).")
+            throw JacIPAError.message("Format de compression inconnu pour \(filename). Formats gérés : tar, gz, xz, lzma, zst, bz2.")
         }
     }
 
