@@ -1,8 +1,8 @@
 import Foundation
 
-/// Une app installée dans LiveContainer (Documents/Applications/<id>/X.app).
+/// Une app installée dans LiveContainer (Documents/Applications/<bundleId>.app).
 struct InstalledApp: Identifiable, Hashable, Sendable {
-    let id: String            // nom du dossier (UUID LiveContainer)
+    let id: String            // nom du dossier dans Applications/ (sans .app)
     let bundleURL: URL
     let name: String
     let bundleId: String
@@ -29,18 +29,24 @@ struct InstalledApp: Identifiable, Hashable, Sendable {
 /// Lecture de la bibliothèque LiveContainer.
 ///
 /// JacIPA tourne *dans* LiveContainer : son propre .app est dans
-/// `…/LiveContainer/Documents/Applications/<id>/JacIPA.app`. En remontant de deux dossiers on
-/// retrouve toutes les apps installées. Si ça ne marche pas (autre disposition), l'utilisateur
-/// choisit le dossier « Applications » une fois via Fichiers et on garde un signet.
+/// `…/LiveContainer/Documents/Applications/com.mammouthgaming.JacIPA.app`. En remontant d'un
+/// dossier on retrouve toutes les apps installées. Si ça ne marche pas (dossier caché par
+/// LiveContainer, autre disposition), l'utilisateur choisit « Applications » une fois via
+/// Fichiers et on garde un signet.
 enum InstalledApps {
     private static let bookmarkKey = "applicationsFolderBookmark"
 
     /// Dossier Applications déduit de l'emplacement de JacIPA, s'il a la bonne forme.
+    /// LiveContainer range les apps soit en `Applications/<bundleId>.app` (récent),
+    /// soit en `Applications/<id>/X.app` (ancien) : on regarde 1 puis 2 niveaux au-dessus.
     static var automaticFolder: URL? {
         let own = Bundle.main.bundleURL.resolvingSymlinksInPath()
-        let candidate = own.deletingLastPathComponent().deletingLastPathComponent()
-        guard candidate.lastPathComponent == "Applications" else { return nil }
-        return isApplicationsFolder(candidate) ? candidate : nil
+        let candidates = [own.deletingLastPathComponent(),
+                          own.deletingLastPathComponent().deletingLastPathComponent()]
+        for candidate in candidates where candidate.lastPathComponent == "Applications" {
+            if isApplicationsFolder(candidate) { return candidate }
+        }
+        return nil
     }
 
     /// Dossier choisi par l'utilisateur (signet), s'il existe encore.
@@ -78,17 +84,28 @@ enum InstalledApps {
     /// true si le dossier vient de la déduction automatique (JacIPA tourne bien dans LiveContainer).
     static var isAutomatic: Bool { bookmarkedFolder == nil && automaticFolder != nil }
 
-    /// Un dossier Applications contient au moins un sous-dossier avec un .app dedans.
+    /// Un dossier Applications contient au moins un .app (directement ou dans un sous-dossier).
     static func isApplicationsFolder(_ url: URL) -> Bool {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-        guard let children = try? FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
-            return false
+        return !appBundles(in: url).isEmpty
+    }
+
+    /// Tous les bundles .app du dossier : `(identifiant du dossier, URL du .app)`.
+    /// Gère `X.app` directement et `<id>/X.app`.
+    private static func appBundles(in folder: URL) -> [(id: String, bundle: URL)] {
+        guard let children = try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles]) else {
+            return []
         }
+        var found: [(id: String, bundle: URL)] = []
         for child in children where (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
-            if appBundle(in: child) != nil { return true }
+            if child.pathExtension == "app" {
+                found.append((child.deletingPathExtension().lastPathComponent, child))
+            } else if let bundle = appBundle(in: child) {
+                found.append((child.lastPathComponent, bundle))
+            }
         }
-        return false
+        return found
     }
 
     private static func appBundle(in folder: URL) -> URL? {
@@ -112,15 +129,11 @@ enum InstalledApps {
         }
         ensureAccess(folder)
 
-        let fm = FileManager.default
-        let children = try fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles])
         let ownBundleId = Bundle.main.bundleIdentifier ?? "com.mammouthgaming.JacIPA"
         var apps: [InstalledApp] = []
 
-        for child in children {
-            guard (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
-                  let bundle = appBundle(in: child) else { continue }
-            if let app = read(bundle: bundle, id: child.lastPathComponent, ownBundleId: ownBundleId) {
+        for entry in appBundles(in: folder) {
+            if let app = read(bundle: entry.bundle, id: entry.id, ownBundleId: ownBundleId) {
                 apps.append(app)
             }
         }
