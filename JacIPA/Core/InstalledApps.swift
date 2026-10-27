@@ -153,8 +153,12 @@ enum InstalledApps {
         let executable = plist["CFBundleExecutable"] as? String ?? bundle.deletingPathExtension().lastPathComponent
         let name = plist["CFBundleDisplayName"] as? String ?? plist["CFBundleName"] as? String ?? executable
         // LiveContainer peut remplacer CFBundleIdentifier par le sien (option « bundle id de LC »)
-        // et garde l'original dans LCOrignalBundleIdentifier (faute d'orthographe voulue, c'est leur clé).
-        let bundleId = plist["LCOrignalBundleIdentifier"] as? String
+        // et garde l'original dans LCAppInfo.plist, clé LCOrignalBundleIdentifier (faute d'orthographe
+        // voulue : c'est leur clé). Anciennes versions : la clé était dans Info.plist.
+        let lcInfo = (try? Data(contentsOf: bundle.appendingPathComponent("LCAppInfo.plist")))
+            .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
+        let bundleId = lcInfo?["LCOrignalBundleIdentifier"] as? String
+            ?? plist["LCOrignalBundleIdentifier"] as? String
             ?? plist["CFBundleIdentifier"] as? String
             ?? "?"
         let version = plist["CFBundleShortVersionString"] as? String ?? ""
