@@ -223,8 +223,10 @@ enum IPAInspector {
                 }
                 details.append("\(item.name)/ exporté")
             } else if let e = zip.entry(named: item.id) {
-                try ExportStore.write(try zip.read(e), to: folder.appendingPathComponent(item.name))
-                details.append("\(item.name) exporté")
+                var data = try zip.read(e)
+                let note = preparedForLiveContainer(&data)
+                try ExportStore.write(data, to: folder.appendingPathComponent(item.name))
+                details.append("\(item.name) exporté" + note)
             }
         }
 
@@ -232,6 +234,18 @@ enum IPAInspector {
                         output: folder.lastPathComponent, details: details)
         return IPAActionResult(outputURL: folder, details: details,
                                warnings: ["Pour LiveContainer : importe les .dylib dans Tweaks → dossier de l'app. Les .framework marchent rarement tels quels."])
+    }
+
+    /// LiveContainer rajoute LC_RPATH @loader_path à chaque dylib importé dans Tweaks ; s'il y est déjà,
+    /// dyld refuse le tweak (« duplicate LC_RPATH »). Retire ces rpath et les commandes en double.
+    /// Renvoie une note pour l'historique ("" si rien à faire). Les .framework ne sont pas touchés :
+    /// LiveContainer ne les patche pas à l'import.
+    private static func preparedForLiveContainer(_ data: inout Data) -> String {
+        guard MachO.isMachO(data),
+              let prepared = try? MachO.preparingForLiveContainer(data),
+              !prepared.removed.isEmpty else { return "" }
+        data = prepared.data
+        return " (retiré : " + prepared.removed.joined(separator: ", ") + ")"
     }
 
     // MARK: - Nettoyage
