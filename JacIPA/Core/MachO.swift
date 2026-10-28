@@ -151,13 +151,45 @@ enum MachO {
     /// Retire les commandes LC_LOAD_*DYLIB dont le chemin satisfait `matching`, dans toutes les tranches.
     /// Les commandes restantes sont tassées, la fin est mise à zéro, ncmds / sizeofcmds mis à jour.
     static func removingDylibs(from input: Data, matching: (String) -> Bool) throws -> (data: Data, removed: [String]) {
+        try removingCommands(from: input) { _, cmd, path in
+            dylibCommands.contains(cmd) && matching(path) ? path : nil
+        }
+    }
+
+    /// LC_RPATH que LiveContainer ajoute lui-même à chaque tweak importé (LCPatchAddRPath).
+    /// S'ils sont déjà dans le dylib, dyld refuse de le charger : « duplicate LC_RPATH ».
+    static let liveContainerRpaths: Set<String> = ["@executable_path/../../Tweaks", "@loader_path"]
+
+    /// Prépare un .dylib (ou l'exécutable d'un .framework) pour LiveContainer → Tweaks : retire les LC_RPATH
+    /// que LiveContainer rajoutera, et les LC_RPATH / LC_LOAD_*DYLIB en double (première occurrence gardée).
+    static func preparingForLiveContainer(_ input: Data) throws -> (data: Data, removed: [String]) {
+        var seen = Set<String>()
+        var currentSlice = -1
+        return try removingCommands(from: input) { sliceIndex, cmd, path in
+            if sliceIndex != currentSlice {
+                seen.removeAll()
+                currentSlice = sliceIndex
+            }
+            let isRpath = cmd == lcRpath
+            if isRpath, liveContainerRpaths.contains(path) { return "LC_RPATH " + path }
+            if !seen.insert((isRpath ? "rpath:" : "dylib:") + path).inserted {
+                return (isRpath ? "LC_RPATH " : "LC_LOAD_DYLIB ") + path + " (doublon)"
+            }
+            return nil
+        }
+    }
+
+    /// Moteur commun : dans chaque tranche, retire les commandes « chaîne » (LC_LOAD_*DYLIB, LC_RPATH) pour
+    /// lesquelles `drop(tranche, cmd, chemin)` renvoie un libellé. Le reste est tassé, la fin mise à zéro,
+    /// ncmds / sizeofcmds mis à jour.
+    private static func removingCommands(from input: Data,
+                                         drop: (Int, UInt32, String) -> String?) throws -> (data: Data, removed: [String]) {
         var d = Data(input)
         var removed: [String] = []
 
-        for slice in try slices(in: d) {
-            let headerSize = slice.is64 ? 32 : 28
-            let start = slice.offset + headerSize
-            let end = start + slice.sizeofcmds
+        for (sliceIndex, slice) in try slices(in: d).enumerated() {
+            let start = slice.commandsStart
+            let end = slice.commandsEnd
             var kept = Data()
             var keptCount = 0
             var p = start
@@ -168,18 +200,17 @@ enum MachO {
                 let cmdsize = Int(d.u32(p + 4))
                 guard cmdsize >= 8, p + cmdsize <= end else { break }
 
-                var drop = false
-                if dylibCommands.contains(cmd) {
+                var label: String?
+                if dylibCommands.contains(cmd) || cmd == lcRpath {
                     let nameOff = Int(d.u32(p + 8))
                     if nameOff < cmdsize {
                         let path = d.cString(p + nameOff, maxLength: cmdsize - nameOff)
-                        if matching(path) {
-                            drop = true
-                            removed.append(path)
-                        }
+                        label = drop(sliceIndex, cmd, path)
                     }
                 }
-                if !drop {
+                if let label {
+                    removed.append(label)
+                } else {
                     kept.append(d.copy(p, cmdsize))
                     keptCount += 1
                 }
