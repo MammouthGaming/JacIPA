@@ -382,9 +382,7 @@ struct InstalledAppDetailView: View {
         } header: {
             Text("Tweaks dans Frameworks/ (\(app.tweaks.count + app.frameworks.count))")
         } footer: {
-            if !app.tweaks.isEmpty {
-                Text("Ils seront réinjectés tels quels dans le nouvel IPA.")
-            }
+            Text("À la mise à jour, tout ce que l'app installée a en plus du stock (dylibs, frameworks, .bundle comme MoeMulti.bundle) est transplanté tel quel dans le nouvel IPA, avec les mêmes commandes de chargement.")
         }
     }
 
@@ -407,7 +405,7 @@ struct InstalledAppDetailView: View {
         } header: {
             Text("Actions")
         } footer: {
-            Text("1. Télécharge le nouvel IPA déchiffré (decrypt.day). 2. Choisis-le ici : JacIPA vérifie que c'est la même app, réinjecte tes tweaks, et te donne l'IPA. 3. Partage-le vers LiveContainer : même bundle, il remplace l'app en gardant ses données.")
+            Text("1. Télécharge le nouvel IPA déchiffré (decrypt.day). 2. Choisis-le ici : JacIPA vérifie que c'est la même app, transplante tout ce que l'app installée a en plus (tweaks, correctifs, bundles), et te donne l'IPA. 3. Partage-le vers LiveContainer : même bundle, il remplace l'app en gardant ses données.")
         }
     }
 
@@ -443,23 +441,15 @@ struct InstalledAppDetailView: View {
                     throw JacIPAError.message("L'IPA choisi (\(newVersion)) est plus vieux que la version installée (\(app.version)).")
                 }
 
-                let files = app.injectableURLs
-                if files.isEmpty {
-                    // Rien à garder : on copie l'IPA tel quel dans Exports pour le partager.
-                    let out = ExportStore.uniqueFile(named: ExportStore.sanitize(analysis.appName) + "-\(newVersion).ipa")
-                    try FileManager.default.copyItem(at: local, to: out)
-                    ExportStore.log(tool: "Mettre à jour", source: local.lastPathComponent, output: out.lastPathComponent,
-                                    details: ["Aucun tweak à réinjecter"])
-                    result = IPAActionResult(outputURL: out, details: ["Aucun tweak dans l'app installée : IPA copié tel quel."],
-                                             warnings: [])
-                } else {
-                    workingLabel = "Réinjection de \(files.count) fichier(s)…"
-                    var r = try await IPAInspector.inject(analysis, files: files)
-                    r = IPAActionResult(outputURL: r.outputURL,
-                                        details: ["\(app.versionText) → \(newVersion)"] + r.details,
-                                        warnings: r.warnings)
-                    result = r
-                }
+                // Tout ce que l'app installée a en plus du stock (Frameworks/*.dylib, .framework, .bundle à la racine
+                // comme MoeMulti.bundle) est transplanté tel quel, et les commandes de chargement ajoutées au binaire
+                // (LOAD_DYLIB ou LOAD_WEAK_DYLIB) sont recréées à l'identique. S'il n'y a rien : IPA copié tel quel.
+                workingLabel = "Transplantation des ajouts de l'app installée…"
+                var r = try await IPAInspector.update(analysis, from: app.bundleURL, executable: app.executable)
+                r = IPAActionResult(outputURL: r.outputURL,
+                                    details: ["\(app.versionText) → \(newVersion)"] + r.details,
+                                    warnings: r.warnings)
+                result = r
             } catch {
                 errorText = error.localizedDescription
             }

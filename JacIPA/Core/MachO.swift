@@ -257,8 +257,11 @@ enum MachO {
 
     /// Ajoute des LC_LOAD_DYLIB (`paths`, ex. `@rpath/GTok.dylib`) à la fin des commandes de chargement
     /// de chaque tranche, plus un LC_RPATH `rpath` s'il manque. Même principe qu'insert_dylib / optool.
+    /// `weak` : LC_LOAD_WEAK_DYLIB à la place (l'app démarre même si le dylib manque ou refuse de se
+    /// charger ; c'est ce que font cyan et les IPA « Moe »).
     static func addingDylibs(to input: Data, paths: [String],
-                             rpath: String = "@executable_path/Frameworks") throws -> (data: Data, added: [String], warnings: [String]) {
+                             rpath: String = "@executable_path/Frameworks",
+                             weak: Bool = false) throws -> (data: Data, added: [String], warnings: [String]) {
         var d = Data(input)
         var added: [String] = []
         var warnings: [String] = []
@@ -273,8 +276,8 @@ enum MachO {
                 names.append("LC_RPATH " + rpath)
             }
             for path in paths where !existing.contains(path) {
-                newCmds.append(stringCommand(lcLoadDylib, nameOffset: 24, path: path, dylibFields: true))
-                names.append("LC_LOAD_DYLIB " + path)
+                newCmds.append(stringCommand(weak ? lcLoadWeakDylib : lcLoadDylib, nameOffset: 24, path: path, dylibFields: true))
+                names.append((weak ? "LC_LOAD_WEAK_DYLIB " : "LC_LOAD_DYLIB ") + path)
             }
             if names.isEmpty {
                 warnings.append("Tranche \(slice.arch) : le dylib était déjà chargé, rien à ajouter.")
