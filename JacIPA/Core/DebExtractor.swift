@@ -6,6 +6,8 @@ struct ExtractedFile: Identifiable, Sendable, Hashable {
     let size: Int
     let dependencies: [String]
     let warnings: [String]
+    /// Corrections appliquées au fichier exporté (ex. LC_RPATH retirés pour LiveContainer).
+    let fixes: [String]
 
     var id: String { exportedURL.path }
 }
@@ -83,30 +85,38 @@ enum DebExtractor {
 
             if path.hasSuffix(".dylib") {
                 let out = folder.appendingPathComponent(fileName)
-                try ExportStore.write(e.data, to: out)
+                var data = e.data
                 var deps: [String] = []
                 var warnings: [String] = []
-                if let slices = try? MachO.slices(in: e.data), let first = slices.first {
+                var fixes: [String] = []
+                if let slices = try? MachO.slices(in: data), let first = slices.first {
                     deps = first.dylibs.map(\.path)
                     if !slices.contains(where: { $0.cpuType == 0x0100_000C }) {
                         warnings.append("Pas de tranche arm64 : ne se chargera pas sur un iPhone récent.")
                     }
+                    // LiveContainer rajoute lui-même LC_RPATH @loader_path à l'import : s'il est déjà là,
+                    // dyld refuse le tweak (« duplicate LC_RPATH »). On le retire d'avance.
+                    if let prepared = try? MachO.preparingForLiveContainer(data), !prepared.removed.isEmpty {
+                        data = prepared.data
+                        fixes.append("Retiré pour LiveContainer : " + prepared.removed.joined(separator: ", ") + ".")
+                    }
                 } else {
                     warnings.append("Pas un Mach-O lisible.")
                 }
-                if e.data.range(of: Data("/var/jb".utf8)) != nil {
+                try ExportStore.write(data, to: out)
+                if data.range(of: Data("/var/jb".utf8)) != nil {
                     warnings.append("Contient des chemins /var/jb : certaines ressources peuvent manquer dans LiveContainer.")
                 }
-                if e.data.range(of: Data("roothide".utf8)) != nil || e.data.range(of: Data("/rootfs/".utf8)) != nil {
+                if data.range(of: Data("roothide".utf8)) != nil || data.range(of: Data("/rootfs/".utf8)) != nil {
                     isRoothide = true
                 }
-                dylibs.append(ExtractedFile(originalPath: path, exportedURL: out, size: e.data.count,
-                                            dependencies: deps, warnings: warnings))
+                dylibs.append(ExtractedFile(originalPath: path, exportedURL: out, size: data.count,
+                                            dependencies: deps, warnings: warnings, fixes: fixes))
             } else if path.hasSuffix(".plist"), path.contains("DynamicLibraries/") {
                 let out = folder.appendingPathComponent(fileName)
                 try ExportStore.write(e.data, to: out)
                 plists.append(ExtractedFile(originalPath: path, exportedURL: out, size: e.data.count,
-                                            dependencies: [], warnings: []))
+                                            dependencies: [], warnings: [], fixes: []))
             } else if let r = path.range(of: ".bundle/") {
                 let head = String(path[..<r.upperBound].dropLast())          // .../X.bundle
                 let bundleName = (head as NSString).lastPathComponent        // X.bundle

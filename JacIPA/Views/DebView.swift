@@ -113,6 +113,9 @@ struct DebView: View {
                 ForEach(file.warnings, id: \.self) { w in
                     Text("⚠️ " + w).font(.caption).foregroundStyle(.orange)
                 }
+                ForEach(file.fixes, id: \.self) { f in
+                    Text("🔧 " + f).font(.caption).foregroundStyle(.secondary)
+                }
             }
             Spacer()
             ShareLink(item: file.exportedURL) {
