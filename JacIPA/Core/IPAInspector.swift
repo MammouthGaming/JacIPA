@@ -154,6 +154,18 @@ enum IPAInspector {
             }
         }
 
+        // Restes de tweak sans tweak : .bundle à la racine ajoutés après la signature Apple (absents de
+        // CodeResources) ou cyan.entitlements, mais aucun .dylib de tweak. C'est un IPA tweaké dont on a retiré
+        // les dylibs : l'app tourne nue, sans ses correctifs sideload (YouTube Music « hors ligne », par ex.).
+        if !items.contains(where: { $0.kind != .normal }) {
+            let leftovers = tweakLeftovers(zip: zip, appDir: appDir)
+            if leftovers.contains(where: { $0.hasSuffix(".bundle") }) {
+                warnings.append("IPA de tweak incomplet : \(leftovers.joined(separator: ", ")) dans l'app mais aucun .dylib de tweak. L'app tournera nue, sans le tweak ni ses correctifs sideload (ex. YouTube Music « hors ligne »). Il faut l'IPA complet, ou injecter le .dylib (Deb → dylib → Injecter).")
+            } else if !leftovers.isEmpty {
+                warnings.append("Passé par cyan (\(leftovers.joined(separator: ", "))) mais aucun .dylib de tweak : si c'était un IPA tweaké, ses dylibs ont été retirés.")
+            }
+        }
+
         if slices.isEmpty {
             warnings.append("Impossible de dire si l'IPA est chiffré.")
         }
@@ -198,6 +210,41 @@ enum IPAInspector {
         guard name.hasPrefix("Payload/"), name.hasSuffix("/Info.plist") else { return false }
         let parts = name.split(separator: "/")
         return parts.count == 3 && parts[1].hasSuffix(".app")
+    }
+
+    /// Fichiers qu'un tweak laisse à la racine de l'app : les .bundle absents de _CodeSignature/CodeResources
+    /// (donc ajoutés après la signature Apple : MoeMulti.bundle, YTMusicUltimate.bundle…) et cyan.entitlements
+    /// (laissé par l'injecteur cyan). Sans CodeResources lisible, on ne tranche pas pour les .bundle.
+    private static func tweakLeftovers(zip: ZipReader, appDir: String) -> [String] {
+        var bundles: [String] = []
+        var cyan = false
+        for e in zip.entries where e.name.hasPrefix(appDir) {
+            let rest = e.name.dropFirst(appDir.count)
+            guard let first = rest.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: true).first else { continue }
+            let top = String(first)
+            if top == "cyan.entitlements" && !rest.contains("/") { cyan = true }
+            if top.hasSuffix(".bundle") && !bundles.contains(top) { bundles.append(top) }
+        }
+
+        var signed = Set<String>()
+        var readable = false
+        if let entry = zip.entry(named: appDir + "_CodeSignature/CodeResources"),
+           let data = try? zip.read(entry),
+           let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] {
+            readable = true
+            for key in ["files2", "files"] {
+                guard let files = plist[key] as? [String: Any] else { continue }
+                for path in files.keys {
+                    if let top = path.split(separator: "/", maxSplits: 1).first, top.hasSuffix(".bundle") {
+                        signed.insert(String(top))
+                    }
+                }
+            }
+        }
+
+        var result = readable ? bundles.filter { !signed.contains($0) } : []
+        if cyan { result.append("cyan.entitlements") }
+        return result
     }
 
     // MARK: - Extraction des tweaks
@@ -302,6 +349,12 @@ enum IPAInspector {
         }
         if removedCommands.isEmpty {
             warnings.append("Aucune commande de chargement retirée du binaire : les fichiers ont été enlevés mais le binaire n'y faisait pas référence.")
+        }
+        // Retirer tous les dylibs de tweak d'une app qui en dépend la casse en douceur (YouTube Music « hors ligne »,
+        // X connexion refusée) : on prévient. Les .bundle du tweak restent → l'IPA sera signalé « incomplet ».
+        let tweakItems = analysis.items.filter { $0.kind != .normal }
+        if !tweakItems.isEmpty, tweakItems.allSatisfy({ t in items.contains { $0.id == t.id } }) {
+            warnings.append("Tous les dylibs de tweak sont retirés. Si l'un d'eux servait de correctif sideload (connexion, réseau), l'app peut ne plus marcher : YouTube Music « hors ligne », X connexion refusée.")
         }
         warnings.append("La signature de l'IPA n'est plus valide : normal, LiveContainer / SideStore re-signent à l'import.")
 
@@ -626,7 +679,8 @@ enum IPAInspector {
             let note = "Aucun ajout dans l'app installée (ni dylib, ni framework, ni .bundle) : IPA copié tel quel."
             ExportStore.log(tool: "Mettre à jour", source: analysis.sourceURL.lastPathComponent,
                             output: output.lastPathComponent, details: [note])
-            return IPAActionResult(outputURL: output, details: [note], warnings: [])
+            return IPAActionResult(outputURL: output, details: [note],
+                                   warnings: analysis.warnings.filter { $0.hasPrefix("IPA de tweak incomplet") })
         }
 
         // 4. Réécriture du zip : entrées du nouvel IPA (recopiées compressées), binaire principal patché,
