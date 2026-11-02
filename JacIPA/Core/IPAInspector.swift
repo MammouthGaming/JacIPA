@@ -16,6 +16,8 @@ struct IPAItem: Identifiable, Sendable, Hashable {
     let loadIndex: Int?
 
     var isFramework: Bool { name.hasSuffix(".framework") }
+    /// Le dylib contient un correctif sideload (connexion Google, trousseau, App Group, faux App Store).
+    var isSideloadFix: Bool { reason.contains("correctif sideload") }
 }
 
 struct IPAAnalysis: Sendable {
@@ -137,7 +139,13 @@ enum IPAInspector {
         var items: [IPAItem] = []
         for id in order {
             let name = names[id] ?? id
-            let (kind, reason, index) = classify(name: name, loaded: loaded)
+            let (kind, baseReason, index) = classify(name: name, loaded: loaded)
+            var reason = baseReason
+            // Un dylib de tweak qui porte un correctif sideload : à garder chargé (dossier Tweaks) ou injecté.
+            if kind == .tweak, name.hasSuffix(".dylib"), let e = zip.entry(named: id),
+               let data = try? zip.read(e), let markers = sideloadFixMarkers(in: data) {
+                reason += " · correctif sideload (\(markers))"
+            }
             items.append(IPAItem(id: id, name: name, kind: kind, reason: reason, size: sizes[id] ?? 0, loadIndex: index))
         }
         items.sort { a, b in
@@ -160,7 +168,7 @@ enum IPAInspector {
         if !items.contains(where: { $0.kind != .normal }) {
             let leftovers = tweakLeftovers(zip: zip, appDir: appDir)
             if leftovers.contains(where: { $0.hasSuffix(".bundle") }) {
-                warnings.append("IPA de tweak incomplet : \(leftovers.joined(separator: ", ")) dans l'app mais aucun .dylib de tweak. L'app tournera nue, sans le tweak ni ses correctifs sideload (ex. YouTube Music « hors ligne »). Il faut l'IPA complet, ou injecter le .dylib (Deb → dylib → Injecter).")
+                warnings.append("IPA de tweak sans ses dylibs : \(leftovers.joined(separator: ", ")) dans l'app mais aucun .dylib de tweak. L'app tourne nue : si le tweak contenait des correctifs sideload (connexion Google, trousseau, App Group — ex. YouTube Music « hors ligne », X connexion refusée), il doit être chargé quand même : dans LiveContainer, dossier Tweaks sélectionné dans les réglages de l'app, sinon réinjecter le .dylib.")
             } else if !leftovers.isEmpty {
                 warnings.append("Passé par cyan (\(leftovers.joined(separator: ", "))) mais aucun .dylib de tweak : si c'était un IPA tweaké, ses dylibs ont été retirés.")
             }
@@ -204,6 +212,30 @@ enum IPAInspector {
             return (.tweak, "Dylib hors runtime Apple (pas chargé directement par le binaire)", nil)
         }
         return (.normal, ref == nil ? "Framework (chargé à la demande ou par un autre)" : "Framework de l'app", ref?.index)
+    }
+
+    /// Chaînes qui trahissent un correctif sideload dans un dylib de tweak : YTMusicUltimate / YTLite (trousseau
+    /// bundleSeedID, SSOKeychain, Safari sign-in, faux App Store), sideloadFixerLol et MoeLoginFix (X),
+    /// zxPluginsInject de cyan (App Group). Un libellé par famille, pour l'affichage.
+    private static let sideloadMarkers: [(marker: String, label: String)] = [
+        ("bundleSeedID", "trousseau"),
+        ("SSOKeychain", "connexion Google"),
+        ("shouldEnableSafariSignIn", "connexion Google"),
+        ("isFromAppStore", "faux App Store"),
+        ("[zx] app group", "App Group"),
+        ("sideloadFixer", "connexion"),
+        ("LoginFix", "connexion"),
+    ]
+
+    /// Libellés des correctifs sideload trouvés dans le binaire ("trousseau, connexion Google"), nil si aucun.
+    private static func sideloadFixMarkers(in data: Data) -> String? {
+        var found: [String] = []
+        for entry in sideloadMarkers where !found.contains(entry.label) {
+            if data.range(of: Data(entry.marker.utf8)) != nil {
+                found.append(entry.label)
+            }
+        }
+        return found.isEmpty ? nil : found.joined(separator: ", ")
     }
 
     private static func isAppInfoPlist(_ name: String) -> Bool {
@@ -277,10 +309,19 @@ enum IPAInspector {
             }
         }
 
+        var warnings = ["Pour LiveContainer : importe les .dylib dans Tweaks → dossier de l'app, puis réglages de l'app → Tweak Folder. Les .framework marchent rarement tels quels."]
+        let hooking = items.filter { $0.kind == .dependency }.map(\.name)
+        if !hooking.isEmpty {
+            warnings.append("\(hooking.joined(separator: ", ")) : ne le mets pas dans le dossier Tweaks de LiveContainer, il charge déjà son CydiaSubstrate (ElleKit). Deux moteurs de hook dans la même app = comportement imprévisible.")
+        }
+        let fixes = items.filter { $0.isSideloadFix }.map(\.name)
+        if !fixes.isEmpty {
+            warnings.append("\(fixes.joined(separator: ", ")) : correctif sideload (connexion / trousseau / App Group). S'il ne se charge pas depuis le dossier Tweaks, l'app nue ne marche pas (YouTube Music « hors ligne ») : vérifie que le tweak apparaît dans l'app, sinon réinjecte au moins celui-là.")
+        }
+
         ExportStore.log(tool: "Extraire", source: analysis.sourceURL.lastPathComponent,
                         output: folder.lastPathComponent, details: details)
-        return IPAActionResult(outputURL: folder, details: details,
-                               warnings: ["Pour LiveContainer : importe les .dylib dans Tweaks → dossier de l'app. Les .framework marchent rarement tels quels."])
+        return IPAActionResult(outputURL: folder, details: details, warnings: warnings)
     }
 
     /// LiveContainer rajoute LC_RPATH @loader_path à chaque dylib importé dans Tweaks ; s'il y est déjà,
@@ -350,11 +391,14 @@ enum IPAInspector {
         if removedCommands.isEmpty {
             warnings.append("Aucune commande de chargement retirée du binaire : les fichiers ont été enlevés mais le binaire n'y faisait pas référence.")
         }
-        // Retirer tous les dylibs de tweak d'une app qui en dépend la casse en douceur (YouTube Music « hors ligne »,
-        // X connexion refusée) : on prévient. Les .bundle du tweak restent → l'IPA sera signalé « incomplet ».
+        // Retirer un correctif sideload casse l'app en douceur (YouTube Music « hors ligne », X connexion refusée) :
+        // on nomme les dylibs concernés. Les .bundle du tweak restent → l'IPA sera signalé « sans ses dylibs ».
+        let fixes = items.filter { $0.isSideloadFix }.map(\.name)
         let tweakItems = analysis.items.filter { $0.kind != .normal }
-        if !tweakItems.isEmpty, tweakItems.allSatisfy({ t in items.contains { $0.id == t.id } }) {
-            warnings.append("Tous les dylibs de tweak sont retirés. Si l'un d'eux servait de correctif sideload (connexion, réseau), l'app peut ne plus marcher : YouTube Music « hors ligne », X connexion refusée.")
+        if !fixes.isEmpty {
+            warnings.append("Correctif(s) sideload retiré(s) : \(fixes.joined(separator: ", ")). Sans eux l'app nue ne marche pas (YouTube Music « hors ligne », X connexion refusée). Dans LiveContainer : ces .dylib dans le dossier Tweaks → réglages de l'app → Tweak Folder, et aucune alerte au lancement. Si ça ne suffit pas, réinjecte au moins ceux-là.")
+        } else if !tweakItems.isEmpty, tweakItems.allSatisfy({ t in items.contains { $0.id == t.id } }) {
+            warnings.append("Tous les dylibs de tweak sont retirés. Si l'un d'eux servait de correctif sideload (connexion, trousseau, App Group), l'app nue ne marchera pas sans lui : YouTube Music « hors ligne », X connexion refusée.")
         }
         warnings.append("La signature de l'IPA n'est plus valide : normal, LiveContainer / SideStore re-signent à l'import.")
 
@@ -680,7 +724,7 @@ enum IPAInspector {
             ExportStore.log(tool: "Mettre à jour", source: analysis.sourceURL.lastPathComponent,
                             output: output.lastPathComponent, details: [note])
             return IPAActionResult(outputURL: output, details: [note],
-                                   warnings: analysis.warnings.filter { $0.hasPrefix("IPA de tweak incomplet") })
+                                   warnings: analysis.warnings.filter { $0.hasPrefix("IPA de tweak sans ses dylibs") })
         }
 
         // 4. Réécriture du zip : entrées du nouvel IPA (recopiées compressées), binaire principal patché,
